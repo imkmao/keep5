@@ -2,7 +2,7 @@
   <img src="assets/hero.png" width="300" alt="keep5" />
   <h1>keep5</h1>
   <p><b>Reclaim the time you waste waiting.</b></p>
-  <a href="https://github.com/imsodasu/keep5/stargazers"><img src="https://img.shields.io/github/stars/imsodasu/keep5?style=flat-square&color=f5b544" alt="Stars"></a>
+  <a href="https://github.com/imkmao/keep5/stargazers"><img src="https://img.shields.io/github/stars/imkmao/keep5?style=flat-square&color=f5b544" alt="Stars"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-2b2b2b?style=flat-square" alt="License"></a>
   <img src="https://img.shields.io/badge/macOS%20%C2%B7%20Linux-2b2b2b?style=flat-square" alt="macOS · Linux">
   <img src="https://img.shields.io/badge/deps-none%20(stdlib)-2b2b2b?style=flat-square" alt="Zero dependencies">
@@ -40,7 +40,7 @@ Two layers: **get it onto your machine** (git's job), then **start using it** (`
 
 ```sh
 # 1. get it — nothing of ours is "installed" here; git just clones the source
-git clone https://github.com/imsodasu/keep5.git
+git clone https://github.com/imkmao/keep5.git
 cd keep5
 chmod +x keep5.py
 ln -sf "$PWD/keep5.py" /usr/local/bin/keep5   # puts `keep5` on your PATH (sudo if needed)
@@ -51,6 +51,20 @@ keep5 enable     # install + start the background job
 ```
 
 That's it. **After the one-time install above, first run is just `keep5 setup` → `keep5 enable`.** Then it runs itself.
+
+### Upgrading from 1.0.0
+
+The launchd label changed in 1.1.0 (`com.imsodasu.keep5` → `com.imkmao.keep5`, following a
+GitHub rename). If you installed 1.0.0 on macOS, clear the old job once, or you'll end up
+running two:
+
+```sh
+launchctl unload ~/Library/LaunchAgents/com.imsodasu.keep5.plist
+rm ~/Library/LaunchAgents/com.imsodasu.keep5.plist
+keep5 enable
+```
+
+Linux is unaffected — the systemd units were never named after the account.
 
 ## Keep it running
 
@@ -86,7 +100,7 @@ next reset:  07-25 18:00  (in 2h13m)
 Exactly two knobs:
 
 - **Trigger interval** — where it lives depends on the OS:
-  - macOS: `StartInterval` (seconds) in `~/Library/LaunchAgents/com.imsodasu.keep5.plist`.
+  - macOS: `StartInterval` (seconds) in `~/Library/LaunchAgents/com.imkmao.keep5.plist`.
   - Linux: `OnUnitActiveSec` in `~/.config/systemd/user/keep5.timer`.
 
   Default `300` (5 min). To change it: edit that value, then `keep5 disable && keep5 enable` to reload (enable won't overwrite an existing unit, so your edit sticks). Worst case you lose one interval per window — 5 min ≈ 1.7% of a 5-hour window.
@@ -118,4 +132,4 @@ Free, forever. No Pro version, no SaaS.
 
 ## License
 
-[MIT](LICENSE) © 2026 imsodasu.
+[MIT](LICENSE) © 2026 imkmao.

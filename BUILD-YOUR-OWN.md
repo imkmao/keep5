@@ -139,6 +139,6 @@ There isn't more. If your agent has the ideas above it will land in an
 afternoon with very little wasted compute — which is the point of this page.
 
 And if, having read all that, you'd rather not maintain your own copy of a
-throwaway patch: [keep5 is right here](https://github.com/imsodasu/keep5#install),
+throwaway patch: [keep5 is right here](https://github.com/imkmao/keep5#install),
 we already burned the tokens, and it does exactly this — clone it and you're
 running in two commands. Either way — glad the notes help.

@@ -33,7 +33,7 @@ import urllib.error
 import urllib.request
 from getpass import getpass, getuser
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 DIR = os.path.expanduser("~/.keep5")
 STATE = os.path.join(DIR, "next_reset")
@@ -51,7 +51,7 @@ H7_STATUS = "anthropic-ratelimit-unified-7d-status"
 MACOS = sys.platform == "darwin"
 
 # macOS: launchd
-LABEL = "com.imsodasu.keep5"
+LABEL = "com.imkmao.keep5"
 PLIST = os.path.expanduser(f"~/Library/LaunchAgents/{LABEL}.plist")
 # Linux: systemd --user
 UNIT_DIR = os.path.expanduser("~/.config/systemd/user")

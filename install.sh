@@ -9,7 +9,7 @@
 # step below. Override locations with KEEP5_HOME / KEEP5_BIN.
 set -eu
 
-RAW="https://raw.githubusercontent.com/imsodasu/keep5/main/keep5.py"
+RAW="https://raw.githubusercontent.com/imkmao/keep5/main/keep5.py"
 SHARE="${KEEP5_HOME:-$HOME/.local/share/keep5}"
 BIN="${KEEP5_BIN:-$HOME/.local/bin}"
 
