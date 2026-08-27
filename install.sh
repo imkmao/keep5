@@ -5,8 +5,8 @@
 #   curl -fsSL https://keep5.pages.dev/install.sh | sh
 #
 # Installs the one file to ~/.local/share/keep5/ and links it into ~/.local/bin
-# (no sudo). It does NOT touch your token — that's the separate `keep5 setup`
-# step below. Override locations with KEEP5_HOME / KEEP5_BIN.
+# (no sudo). It does NOT touch Claude or Codex credentials — enrollment is the
+# separate `keep5 setup` step below. Override locations with KEEP5_HOME / KEEP5_BIN.
 set -eu
 
 RAW="https://raw.githubusercontent.com/imkmao/keep5/main/keep5.py"
@@ -27,5 +27,5 @@ case ":$PATH:" in
 esac
 
 echo
-echo "next:  keep5 setup    # paste your token (from: claude setup-token)"
+echo "next:  keep5 setup    # Claude token and/or existing Codex ChatGPT login"
 echo "       keep5 enable   # start the background job"

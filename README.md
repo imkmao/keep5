@@ -9,13 +9,13 @@
   <a href="https://keep5.pages.dev"><img src="https://img.shields.io/badge/site-keep5.pages.dev-f5b544?style=flat-square" alt="Site"></a>
 </div>
 
-Keep your Claude Code subscription's next 5-hour usage window starting **as early as possible**, so you waste less time waiting.
+Keep your Claude Code and Codex subscription windows starting **as early as possible**, so you waste less time waiting.
 
 It does **not** give you more quota. It optimizes **time, not usage** — the hours you were away become time already served on your next lockout.
 
 ## The problem
 
-Claude Code subscriptions use rolling 5-hour usage windows. The catch:
+Claude Code and Codex subscriptions use 5-hour usage windows. The catch is the same:
 
 > **After a window's reset time passes, the next window does not start on its own.** It starts only when you send your next request.
 
@@ -25,14 +25,15 @@ So if your window resets at 13:00 but you don't come back until 16:00, your new 
 
 A tiny one-shot script, run every few minutes by a background scheduler (launchd on macOS, a systemd `--user` timer on Linux). Each run:
 
-- `now < next_reset` → do nothing (silent).
-- `now ≥ next_reset` → send one minimal request. This opens the next window immediately, and the response header `anthropic-ratelimit-unified-5h-reset` tells us the new window's reset time, which we save.
-- If your **weekly** cap is spent, that request is refused (`…-7d-status: rate_limited`) — nothing can open until the weekly resets. So we read the weekly reset from the same headers and wait for *that* instead of retrying every few minutes. Firing right at the weekly reset also opens the fresh weekly window at once.
-- No state file yet (first run) → just fire once and record.
+- Each enrolled runtime has its own reset clock. Before it is due, that runtime is silent.
+- Claude Code sends the existing minimal OAuth request and reads the 5-hour/weekly reset headers.
+- Codex uses the official `codex app-server`, waits for a completed minimal inference, and saves a reset only after two observations agree. A moving `now+5h` idle projection is rejected.
+- If a weekly limit is the wall, keep5 saves that reset and waits instead of retrying every few minutes.
+- One runtime failing is logged without stopping the other.
 
 That single request both *starts* the next window and *reports* when it ends. As long as the job runs, your window is always kept "alive" the moment it's eligible.
 
-Zero dependencies (Python 3 stdlib). macOS or Linux. Single Claude Code account. Hardcoded on purpose — if the platform changes how windows work, this tool dies, and that's fine.
+Zero Python dependencies (stdlib only). macOS or Linux. One Claude Code account and one Codex account, with deliberately separate hardcoded paths and no provider framework. If either platform changes how windows work, that path breaks, and that's fine.
 
 ## Install
 
@@ -45,12 +46,15 @@ cd keep5
 chmod +x keep5.py
 ln -sf "$PWD/keep5.py" /usr/local/bin/keep5   # puts `keep5` on your PATH (sudo if needed)
 
-# 2. start using it
-keep5 setup      # paste your token (from `claude setup-token`); stored chmod 600
+# 2. optional: sign Codex in with your ChatGPT subscription
+codex login      # on a headless box: codex login --device-auth
+
+# 3. start using it
+keep5 setup      # set up Claude and/or enroll the current Codex ChatGPT login
 keep5 enable     # install + start the background job
 ```
 
-That's it. **After the one-time install above, first run is just `keep5 setup` → `keep5 enable`.** Then it runs itself.
+That's it. **After the one-time install above, first run is just `keep5 setup` → `keep5 enable`.** You may skip Claude at the token prompt; Codex is enrolled only by this explicit setup run, never merely because a login appears later.
 
 ### Upgrading from 1.0.0
 
@@ -81,19 +85,25 @@ A background listener is inherently at odds with a machine that goes to sleep: a
 
 | Command | What it does |
 |---|---|
-| `keep5 setup` | Paste your Claude OAuth token (from `claude setup-token`, valid ~1 year). Written to `~/.keep5/oat`, `chmod 600`. Re-run whenever the token expires. |
+| `keep5 setup` | Set up either or both runtimes. Paste or skip the Claude OAuth token; if `codex` is present, enroll its existing **ChatGPT** login. API-key login is rejected because it uses separate API billing. |
 | `keep5 enable` | Install the background job (a launchd plist on macOS, a systemd `--user` service + timer on Linux) and start it. Tells you to run `keep5 setup` first if you haven't. |
 | `keep5 disable` | Stop and remove the background job — no more ticks. |
-| `keep5 status` | Is a token set? Is it enabled (and at what interval)? On Linux, is lingering on? When does the current window reset — or is a fire overdue? One screen; fire history lives in the log. |
+| `keep5 status` | Setup and next reset for Claude Code and Codex, plus scheduler/interval and Linux linger state. One screen; fire history lives in the log. |
 | `keep5 version` | Print the version (`keep5 <x.y.z>`) and exit. |
 | `keep5` | One tick — what the scheduler runs every few minutes. Silent unless it's time to fire. |
 
 ```console
 $ keep5 status
-setup:       yes
-enabled:     yes  (tick every 5m)
-next reset:  07-25 18:00  (in 2h13m)
+claude setup: yes
+codex setup:  yes
+enabled:      yes  (tick every 5m)
+claude reset: in 2h13m  (08-26 18:00 PDT)
+codex reset:  in 3h54m  (08-26 19:41 PDT)
 ```
+
+The relative wait comes first. The timestamp is the host machine's local time,
+with its time-zone abbreviation shown explicitly; there is no keep5 time-zone
+setting.
 
 ## Config
 
@@ -113,14 +123,15 @@ No config file.
 Everything lives under `~/.keep5/`:
 
 - `oat` — your token (`chmod 600`).
-- `next_reset` — the one state file: the current window's reset time (Unix seconds). Read every tick to decide whether to fire.
-- `log` — one line **per fire**: `ok: next reset <iso>` when the request comes back with a reset time, `weekly-limited: waiting for weekly reset <iso>` when the weekly cap is the wall (we back off to that reset rather than retrying), `failed: <error>` when the request just doesn't come back (bad token, network, …). Silent do-nothing ticks write nothing, so a healthy log is roughly one `ok` line per 5-hour window; a gap much longer than that means the tick wasn't running during it (e.g. the machine slept). Unexpected crashes go to `/tmp/keep5.err`.
+- `next_reset` — Claude Code's current reset time (Unix seconds).
+- `codex_next_reset` — Codex enrollment plus reset state. Successful setup writes `0`, so the next tick establishes the first real reset.
+- `log` — one line per fire, prefixed `claude` or `codex`: `ok: next reset <iso>`, `weekly-limited: waiting for weekly reset <iso>`, `codex pending: waiting to confirm reset; state unchanged`, or `failed: <error>`. Silent ticks write nothing. Unexpected crashes go to `/tmp/keep5.err`.
 
 `keep5 status` reads these for you; the log is there when you want the full fire history.
 
 ## Build your own
 
-There's no magic here — one stdlib Python file, and a coding agent could write you your own in an afternoon. If you'd rather do that, [**BUILD-YOUR-OWN.md**](BUILD-YOUR-OWN.md) is the map: every sharp edge we hit — which header carries the reset, why the window won't open until you poke it, how to back off when the weekly cap is the wall, the launchd/systemd wiring — written down so your agent skips the dead ends and burns fewer tokens.
+There's no magic here — one stdlib Python file, and a coding agent could write you your own in an afternoon. If you'd rather do that, [**BUILD-YOUR-OWN.md**](BUILD-YOUR-OWN.md) is the map: Claude's headers, Codex App Server's completion/reset handshake, weekly fallback, and scheduler wiring.
 
 Or just use this one — same result, nothing to build, nothing to maintain.
 

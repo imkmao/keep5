@@ -15,8 +15,8 @@ None of this is secret. It's just annoying to find out one 429 at a time.
 
 ## The one idea the whole thing rests on
 
-Claude Code subscriptions use **rolling 5-hour usage windows**. The catch that
-makes a tool worth writing at all:
+Claude Code and Codex subscriptions expose **5-hour usage windows**. The catch
+that makes a tool worth writing at all:
 
 > After a window's reset time passes, the next window **does not start on its
 > own**. It starts only when you send your next request.
@@ -31,7 +31,7 @@ the timer early.** Optimize for *time served*, not usage.
 
 ---
 
-## The token (this trips people up first)
+## Claude Code: the token (this trips people up first)
 
 You do **not** use a normal Anthropic API key (`sk-ant-api…`). Those bill
 per-token against a separate balance — using one would defeat the entire point
@@ -52,7 +52,7 @@ even though the token is valid.
 
 ---
 
-## The request
+## Claude Code: the request
 
 One minimal POST. The smallest thing that counts as "activity":
 
@@ -73,7 +73,7 @@ body:
 Use the cheapest fast model and `max_tokens: 1` — you don't care about the
 answer, only that the request lands and opens the window.
 
-## The headers are the whole reward
+## Claude Code: the headers are the whole reward
 
 The response (success **or** rate-limited) carries the rate-limit state you
 need. These three are what you read:
@@ -89,6 +89,47 @@ Save the 5h reset; that's the only state you need to keep.
 
 ---
 
+## Codex: use App Server, not a private backend
+
+Codex is deliberately a separate path. Do not copy Claude's HTTP code, call a
+private ChatGPT backend, or read the Codex authentication cache. Launch the
+official local interface instead:
+
+```sh
+codex app-server --stdio
+```
+
+The transport is newline-delimited JSON. A minimal stable sequence is:
+
+1. `initialize`, then the `initialized` notification.
+2. `account/read` to require account type `chatgpt`. Reject API-key auth: it is
+   billed through the OpenAI Platform rather than the user's ChatGPT plan.
+3. `account/rateLimits/read` to observe primary (5h) and secondary (weekly)
+   limits.
+4. `thread/start` with an ephemeral, read-only thread and no approvals.
+5. `turn/start` on `gpt-5.6-luna` at low effort with a tiny, tool-free prompt.
+6. Wait for the matching `turn/completed` and require status `completed`.
+7. Read rate limits again and confirm the reset before saving it.
+
+The last step is essential. Before the first real inference, Codex may report a
+primary reset that moves forward with every read — effectively `now+5h`, not an
+active window. `usedPercent` may remain zero after a very small inference due
+to rounding, so it is not proof. Prefer comparing an
+`account/rateLimits/updated` notification from the inference with one
+post-turn read. If no notification arrives, make two post-turn reads a few
+seconds apart. Save only when the selected reset agrees exactly.
+
+When the secondary limit is the wall, save its reset instead. As with Claude,
+this prevents a scheduler from retrying every few minutes when no inference can
+land.
+
+Codex login remains Codex's job: `codex login` locally, or
+`codex login --device-auth` on a headless machine. A setup command should only
+record explicit enrollment; merely discovering a login later must not start
+automated usage.
+
+---
+
 ## The pitfalls that cost us the most
 
 **1. A 429 still gives you the headers.** When the weekly cap is exhausted your
@@ -101,11 +142,10 @@ weekly window at once. (In Python: `urllib.error.HTTPError` still has
 `.headers`.)
 
 **2. Don't poll the API — poll a clock.** The scheduler runs the tick every few
-minutes, but the tick should hit the network **only** when it's actually time.
-Keep one tiny state file with the next reset (Unix seconds). Each tick:
-`now < next_reset` → do nothing, silently; `now >= next_reset` → fire once,
-save the new reset. No state yet (first run) → fire once to bootstrap. This is
-what keeps it invisible and un-abusive: roughly one real request per 5h window.
+minutes, but each runtime should hit its service **only** when its own reset is
+due. Keep one tiny reset file per runtime. `now < next_reset` → do nothing;
+`now >= next_reset` → fire once and save the new reset. Codex's file can double
+as its explicit-enrollment marker by writing `0` during setup.
 
 **3. The scheduler is the actual hard part, not the HTTP.** The one-shot script
 is easy; keeping it running forever is the work.
@@ -130,6 +170,12 @@ buys you almost nothing and just adds noise.
 **6. Fail quiet, retry next tick.** If a request doesn't come back (bad token,
 network blip), log one line and exit 0. The next tick will try again. Don't
 crash, don't spiral, don't alert.
+
+**7. Keep runtime failures separate.** One scheduler can call the Claude and
+Codex paths in sequence, but each path owns its state, trigger, error handling,
+and log entry. If one fails, the other still runs. Resist the temptation to add
+a provider registry or shared reset abstraction; two short hardcoded paths are
+cheaper to understand and delete.
 
 ---
 

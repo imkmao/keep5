@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
-"""keep5 — keep the next Claude Code 5h window starting ASAP.
+"""keep5 — keep the next Claude Code and Codex 5h windows starting ASAP.
 
 Single entry point. With no argument this is the one-shot, stateless tick
 that the scheduler (launchd on macOS, a systemd --user timer on Linux) runs
 every N minutes:
 
-    now < next_reset   -> silent no-op
-    now >= next_reset  -> fire one minimal request, refresh next_reset
-    no/corrupt state   -> cold start: fire once, write next_reset
+Each enrolled runtime keeps its own reset state. At every tick it either stays
+silent before that reset or fires one minimal request and records the next one.
+One runtime failing never stops the other.
 
-The one request both opens the next window and returns the new window's
-reset time in a response header. See BUILD-YOUR-OWN.md.
+Claude Code uses its OAuth token and response headers. Codex uses the official
+Codex App Server with an existing ChatGPT login. See BUILD-YOUR-OWN.md.
 
 With an argument it is the management CLI:
 
-    keep5 setup     paste your Claude token -> ~/.keep5/oat (chmod 600)
+    keep5 setup     set up Claude and enroll a ChatGPT-authenticated Codex
     keep5 enable    install the background job (launchd / systemd --user)
     keep5 disable   stop the background job
-    keep5 status    setup? enabled? next reset (or overdue)?
+    keep5 status    setup and next reset for each runtime
     keep5 version   print the version and exit
 
 First run:  keep5 setup  ->  keep5 enable  ->  done.
@@ -25,6 +25,7 @@ First run:  keep5 setup  ->  keep5 enable  ->  done.
 import json
 import os
 import plistlib
+import selectors
 import shutil
 import subprocess
 import sys
@@ -33,10 +34,11 @@ import urllib.error
 import urllib.request
 from getpass import getpass, getuser
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 DIR = os.path.expanduser("~/.keep5")
 STATE = os.path.join(DIR, "next_reset")
+CODEX_STATE = os.path.join(DIR, "codex_next_reset")
 LOG = os.path.join(DIR, "log")
 TOKEN = os.path.join(DIR, "oat")  # chmod 600
 TOKEN_PREFIX = "sk-ant-oat01-"
@@ -59,6 +61,11 @@ SERVICE = os.path.join(UNIT_DIR, "keep5.service")
 TIMER = os.path.join(UNIT_DIR, "keep5.timer")
 
 INTERVAL = 300  # default tick interval, seconds; the knob lives in the installed unit
+CODEX_IO_TIMEOUT = 5
+CODEX_TURN_TIMEOUT = 60
+CODEX_CONFIRM_DELAY = 2
+CODEX_MODEL = "gpt-5.6-luna"
+CODEX_PENDING_RESET = "waiting to confirm reset; state unchanged"
 
 
 # ---- the tick (what launchd calls, no argument) ----------------------------
@@ -80,6 +87,20 @@ def read_next_reset():
 def write_next_reset(ts):
     os.makedirs(DIR, exist_ok=True)
     with open(STATE, "w") as f:
+        f.write(str(ts))
+
+
+def read_codex_next_reset():
+    try:
+        with open(CODEX_STATE) as f:
+            return int(f.read().strip())
+    except (FileNotFoundError, ValueError):
+        return None
+
+
+def write_codex_next_reset(ts):
+    os.makedirs(DIR, exist_ok=True)
+    with open(CODEX_STATE, "w") as f:
         f.write(str(ts))
 
 
@@ -131,7 +152,9 @@ def trigger():
         raise RuntimeError(f"HTTP {e.code}: {e.reason}")
 
 
-def tick():
+def claude_tick():
+    if not claude_is_setup():
+        return
     next_reset = read_next_reset()
     if next_reset is not None and int(time.time()) < next_reset:
         return  # silent no-op
@@ -139,15 +162,20 @@ def tick():
         reset, weekly = trigger()
         write_next_reset(reset)
         when = time.strftime('%Y-%m-%dT%H:%M:%S%z', time.localtime(reset))
-        log(f"weekly-limited: waiting for weekly reset {when}" if weekly
-            else f"ok: next reset {when}")
+        log(f"claude weekly-limited: waiting for weekly reset {when}" if weekly
+            else f"claude ok: next reset {when}")
     except Exception as e:
-        log(f"failed: {e}")  # one line, then exit 0; next tick retries
+        log(f"claude failed: {e}")  # one line, then exit 0; next tick retries
+
+
+def tick():
+    claude_tick()
+    codex_tick()
 
 
 # ---- management CLI (only on an explicit subcommand) -----------------------
 
-def is_setup():
+def claude_is_setup():
     """True if a token file exists and has the expected shape (not a liveness check)."""
     try:
         with open(TOKEN) as f:
@@ -156,16 +184,260 @@ def is_setup():
         return False
 
 
+def codex_is_setup():
+    return os.path.exists(CODEX_STATE)
+
+
+def is_setup():
+    return claude_is_setup() or codex_is_setup()
+
+
+def codex_executable():
+    found = shutil.which("codex")
+    if found:
+        return found
+    for path in ("~/.npm-global/bin/codex", "~/.local/bin/codex",
+                 "/usr/local/bin/codex", "/opt/homebrew/bin/codex"):
+        path = os.path.expanduser(path)
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    return None
+
+
+def _codex_send(proc, message):
+    proc.stdin.write((json.dumps(message, separators=(",", ":")) + "\n").encode())
+    proc.stdin.flush()
+
+
+def _codex_receive(proc, predicate, notifications, timeout=CODEX_IO_TIMEOUT):
+    selector = selectors.DefaultSelector()
+    selector.register(proc.stdout, selectors.EVENT_READ)
+    deadline = time.monotonic() + timeout
+    try:
+        while time.monotonic() < deadline:
+            while b"\n" in proc.keep5_buffer:
+                line, proc.keep5_buffer = proc.keep5_buffer.split(b"\n", 1)
+                message = json.loads(line)
+                if "method" in message:
+                    notifications.append(message)
+                if predicate(message):
+                    return message
+            ready = selector.select(deadline - time.monotonic())
+            if not ready:
+                break
+            chunk = os.read(proc.stdout.fileno(), 65536)
+            if not chunk:
+                raise RuntimeError(f"codex app-server exited {proc.poll()}")
+            proc.keep5_buffer += chunk
+    finally:
+        selector.close()
+    raise RuntimeError("codex app-server timed out")
+
+
+def _codex_request(proc, request_id, method, notifications, params=None, timeout=CODEX_IO_TIMEOUT):
+    message = {"method": method, "id": request_id}
+    if params is not None:
+        message["params"] = params
+    _codex_send(proc, message)
+    response = _codex_receive(proc, lambda item: item.get("id") == request_id,
+                              notifications, timeout)
+    if "error" in response:
+        raise RuntimeError(f"{method}: {response['error']}")
+    return response["result"]
+
+
+def _codex_stop(proc):
+    proc.terminate()
+    try:
+        proc.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+
+
+def _codex_start():
+    executable = codex_executable()
+    if not executable:
+        raise RuntimeError("codex executable not found (run `keep5 setup`)")
+    proc = subprocess.Popen(
+        [executable, "app-server", "--stdio"], stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0,
+    )
+    proc.keep5_buffer = b""
+    return proc
+
+
+def codex_account_type():
+    proc = _codex_start()
+    notifications = []
+    try:
+        _codex_request(proc, 1, "initialize", notifications, {
+            "clientInfo": {"name": "keep5", "title": "keep5", "version": __version__},
+        })
+        _codex_send(proc, {"method": "initialized", "params": {}})
+        account = _codex_request(proc, 2, "account/read", notifications,
+                                 {"refreshToken": False})
+        return (account.get("account") or {}).get("type")
+    finally:
+        _codex_stop(proc)
+
+
+def codex_pick_reset(limits):
+    secondary = limits.get("secondary")
+    try:
+        secondary_full = secondary and float(secondary.get("usedPercent", 0)) >= 100
+    except (TypeError, ValueError):
+        secondary_full = False
+    weekly = bool(secondary_full)
+    window = secondary if weekly else limits.get("primary")
+    if not window or window.get("resetsAt") is None:
+        raise RuntimeError("no Codex reset in rate-limit response")
+    return int(window["resetsAt"]), weekly
+
+
+def codex_trigger():
+    proc = _codex_start()
+    notifications = []
+    try:
+        _codex_request(proc, 1, "initialize", notifications, {
+            "clientInfo": {"name": "keep5", "title": "keep5", "version": __version__},
+        })
+        _codex_send(proc, {"method": "initialized", "params": {}})
+        account = _codex_request(proc, 2, "account/read", notifications,
+                                 {"refreshToken": False})
+        auth_type = (account.get("account") or {}).get("type")
+        if auth_type != "chatgpt":
+            raise RuntimeError("Codex needs ChatGPT login; API-key auth is not supported")
+
+        before = _codex_request(proc, 3, "account/rateLimits/read", notifications)["rateLimits"]
+        reset, weekly = codex_pick_reset(before)
+        if weekly:
+            time.sleep(CODEX_CONFIRM_DELAY)
+            confirmed = _codex_request(
+                proc, 4, "account/rateLimits/read", notifications)["rateLimits"]
+            observed = codex_pick_reset(confirmed)
+            if observed != (reset, True):
+                raise RuntimeError(CODEX_PENDING_RESET)
+            return observed
+
+        thread = _codex_request(proc, 4, "thread/start", notifications, {
+            "model": CODEX_MODEL,
+            "cwd": DIR,
+            "approvalPolicy": "never",
+            "sandbox": "read-only",
+            "ephemeral": True,
+            "serviceName": "keep5",
+        })["thread"]
+        notifications.clear()
+        started = _codex_request(proc, 5, "turn/start", notifications, {
+            "threadId": thread["id"],
+            "input": [{"type": "text", "text": "Reply with exactly: ok. Do not use tools."}],
+            "sandboxPolicy": {"type": "readOnly", "access": {"type": "fullAccess"}},
+            "effort": "low",
+            "summary": "none",
+        })
+        turn_id = started["turn"]["id"]
+        completed = next((item for item in notifications
+                          if item.get("method") == "turn/completed"
+                          and item.get("params", {}).get("turn", {}).get("id") == turn_id), None)
+        if completed is None:
+            completed = _codex_receive(
+                proc,
+                lambda item: item.get("method") == "turn/completed"
+                and item.get("params", {}).get("turn", {}).get("id") == turn_id,
+                notifications,
+                CODEX_TURN_TIMEOUT,
+            )
+        turn = completed["params"]["turn"]
+        post = _codex_request(proc, 6, "account/rateLimits/read", notifications)["rateLimits"]
+        post_reset = codex_pick_reset(post)
+        if turn.get("status") != "completed":
+            if post_reset[1]:
+                time.sleep(CODEX_CONFIRM_DELAY)
+                confirmed = _codex_request(
+                    proc, 7, "account/rateLimits/read", notifications)["rateLimits"]
+                observed = codex_pick_reset(confirmed)
+                if observed != post_reset:
+                    raise RuntimeError(CODEX_PENDING_RESET)
+                return post_reset
+            error = (turn.get("error") or {}).get("message") or turn.get("status")
+            raise RuntimeError(f"Codex turn did not complete: {error}")
+
+        updates = [item["params"]["rateLimits"] for item in notifications
+                   if item.get("method") == "account/rateLimits/updated"]
+        if updates:
+            observed = codex_pick_reset(updates[-1])
+        else:
+            time.sleep(CODEX_CONFIRM_DELAY)
+            confirmed = _codex_request(
+                proc, 7, "account/rateLimits/read", notifications)["rateLimits"]
+            observed = codex_pick_reset(confirmed)
+        if observed != post_reset:
+            raise RuntimeError(CODEX_PENDING_RESET)
+        return post_reset
+    finally:
+        _codex_stop(proc)
+
+
+def codex_tick():
+    if not codex_is_setup():
+        return
+    next_reset = read_codex_next_reset()
+    if next_reset is not None and int(time.time()) < next_reset:
+        return
+    try:
+        reset, weekly = codex_trigger()
+        write_codex_next_reset(reset)
+        when = time.strftime('%Y-%m-%dT%H:%M:%S%z', time.localtime(reset))
+        log(f"codex weekly-limited: waiting for weekly reset {when}" if weekly
+            else f"codex ok: next reset {when}")
+    except Exception as e:
+        msg = str(e)
+        log(f"codex pending: {msg}" if msg == CODEX_PENDING_RESET
+            else f"codex failed: {e}")
+
+
 def cmd_setup():
-    token = getpass("Paste your Claude token (from `claude setup-token`), then Enter: ").strip()
-    if not token.startswith(TOKEN_PREFIX):
-        sys.exit(f"that doesn't look like a token (expected {TOKEN_PREFIX}…); nothing written.")
-    os.makedirs(DIR, exist_ok=True)
-    with open(TOKEN, "w") as f:
-        f.write(token)
-    os.chmod(TOKEN, 0o600)
-    print(f"wrote {TOKEN} (chmod 600)")
-    print("next:  keep5 enable")
+    claude_setup = claude_is_setup()
+    if claude_setup:
+        prompt = "Paste a replacement Claude token, or Enter to keep the current one: "
+    else:
+        prompt = "Paste your Claude token (from `claude setup-token`), or Enter to skip: "
+    token = getpass(prompt).strip()
+    if token:
+        if not token.startswith(TOKEN_PREFIX):
+            sys.exit(f"that doesn't look like a token (expected {TOKEN_PREFIX}…); nothing written.")
+        os.makedirs(DIR, exist_ok=True)
+        with open(TOKEN, "w") as f:
+            f.write(token)
+        os.chmod(TOKEN, 0o600)
+        print("claude: setup")
+    elif claude_setup:
+        print("claude: setup")
+    else:
+        print("claude: skipped")
+
+    if not codex_executable():
+        print("codex: not found — install Codex, then run `keep5 setup` again.")
+    else:
+        try:
+            auth_type = codex_account_type()
+            if auth_type == "chatgpt":
+                os.makedirs(DIR, exist_ok=True)
+                with open(CODEX_STATE, "w") as f:
+                    f.write("0")
+                print("codex: setup (ChatGPT)")
+            elif auth_type == "apiKey":
+                print("codex: API-key login rejected — run `codex logout`, then `codex login`.")
+            else:
+                print("codex: not logged in — run `codex login` (headless: `codex login --device-auth`).")
+        except Exception as e:
+            print(f"codex: setup failed: {e}")
+
+    if is_setup():
+        print("next:  keep5 enable")
+    else:
+        print("nothing set up yet — finish one runtime, then run `keep5 setup` again.")
 
 
 PLIST_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
@@ -191,7 +463,7 @@ PLIST_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
 """
 
 SERVICE_TEMPLATE = """[Unit]
-Description=keep5 — reopen the Claude usage window on time
+Description=keep5 — reopen Claude Code and Codex usage windows on time
 
 [Service]
 Type=oneshot
@@ -279,7 +551,7 @@ def _enable_linux():
 
 def cmd_enable():
     if not is_setup():
-        sys.exit("no token yet — run `keep5 setup` first.")
+        sys.exit("no runtime yet — run `keep5 setup` first.")
     if not MACOS:
         return _enable_linux()
     if not os.path.exists(PLIST):  # keep an edited StartInterval; regenerate only if missing
@@ -341,7 +613,7 @@ def read_interval():
 
 def cmd_status():
     def fmt(ts):  # absolute, for precision
-        return time.strftime("%m-%d %H:%M", time.localtime(ts))
+        return time.strftime("%m-%d %H:%M %Z", time.localtime(ts))
 
     def dur(secs):  # relative, computed live; largest unit first (d>h>m), <=2 units
         secs = int(secs)
@@ -355,32 +627,35 @@ def cmd_status():
         return f"{m}m"
 
     now = time.time()
-    setup, enabled = is_setup(), _loaded()
+    claude_setup, codex_setup, enabled = claude_is_setup(), codex_is_setup(), _loaded()
     interval = read_interval()
-    setup_val = "yes" if setup else "no  — run 'keep5 setup'"
     enabled_val = f"yes  (tick every {dur(interval)})" if enabled else "no  — run 'keep5 enable'"
-    print(f"{'setup:':13}{setup_val}")
-    print(f"{'enabled:':13}{enabled_val}")
+    print(f"{'claude setup:':14}" + ("yes" if claude_setup else "no  — run 'keep5 setup'"))
+    print(f"{'codex setup:':14}" + ("yes" if codex_setup else "no  — run 'keep5 setup'"))
+    print(f"{'enabled:':14}{enabled_val}")
     if not MACOS:  # the Linux "stays awake" analogue: does it survive logout?
-        print(f"{'linger:':13}" + ("yes" if _linger_on()
+        print(f"{'linger:':14}" + ("yes" if _linger_on()
               else "no  — stops on logout; sudo loginctl enable-linger $USER"))
 
-    # `next reset` only means anything while set up AND enabled; otherwise stay silent
-    if not (setup and enabled):
-        print(f"{'next reset:':13}—")
-        return
-    nr = read_next_reset()
-    if nr is None:
-        print(f"{'next reset:':13}none yet — opens on next tick, else check log")
-        return
-    over = now - nr
-    if over < 0:
-        due = f"in {dur(-over)}"
-    elif over <= interval:
-        due = "due now"
-    else:
-        due = f"⚠ overdue {dur(over)} — check log"
-    print(f"{'next reset:':13}{fmt(nr)}  ({due})")
+    def show_reset(label, setup, read_reset):
+        if not (setup and enabled):
+            print(f"{label:14}—")
+            return
+        nr = read_reset()
+        if nr is None:
+            print(f"{label:14}none yet — opens on next tick, else check log")
+            return
+        over = now - nr
+        if over < 0:
+            due = f"in {dur(-over)}"
+        elif over <= interval:
+            due = "due now"
+        else:
+            due = f"⚠ overdue {dur(over)} — check log"
+        print(f"{label:14}{due}  ({fmt(nr)})")
+
+    show_reset("claude reset:", claude_setup, read_next_reset)
+    show_reset("codex reset:", codex_setup, read_codex_next_reset)
 
 
 def cmd_help():
