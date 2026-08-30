@@ -92,11 +92,14 @@ A background listener is inherently at odds with a machine that goes to sleep: a
 | `keep5 version` | Print the version (`keep5 <x.y.z>`) and exit. |
 | `keep5` | One tick — what the scheduler runs every few minutes. Silent unless it's time to fire. |
 
+Linux example (macOS omits the `linger` line):
+
 ```console
 $ keep5 status
 claude setup: yes
 codex setup:  yes
 enabled:      yes  (tick every 5m)
+linger:       yes
 claude reset: in 2h13m  (08-26 18:00 PDT)
 codex reset:  in 3h54m  (08-26 19:41 PDT)
 ```
