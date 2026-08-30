@@ -13,6 +13,10 @@ Keep your Claude Code and Codex subscription windows starting **as early as poss
 
 It does **not** give you more quota. It optimizes **time, not usage** — the hours you were away become time already served on your next lockout.
 
+**Using a coding agent?** Send it this:
+
+> Install keep5 from https://github.com/imkmao/keep5 and follow the README to set it up.
+
 ## The problem
 
 Claude Code and Codex subscriptions use 5-hour usage windows. The catch is the same:
