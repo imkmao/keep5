@@ -110,7 +110,9 @@ codex reset:  in 3h54m  (08-26 19:41 PDT)
 
 The relative wait comes first. The timestamp is the host machine's local time,
 with its time-zone abbreviation shown explicitly; there is no keep5 time-zone
-setting.
+setting. If Codex is past its reset but the latest Codex fire is still waiting
+for reset confirmation, `status` shows that pending state instead of a generic
+overdue warning.
 
 ## Config
 

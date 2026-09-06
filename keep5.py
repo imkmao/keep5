@@ -630,6 +630,20 @@ def cmd_status():
     claude_setup, codex_setup, enabled = claude_is_setup(), codex_is_setup(), _loaded()
     interval = read_interval()
     enabled_val = f"yes  (tick every {dur(interval)})" if enabled else "no  — run 'keep5 enable'"
+
+    def latest_codex_log_is_pending():
+        try:
+            with open(LOG) as f:
+                lines = f.readlines()
+        except FileNotFoundError:
+            return False
+        for line in reversed(lines):
+            if " codex " in line:
+                return f" codex pending: {CODEX_PENDING_RESET}" in line.rstrip()
+        return False
+
+    codex_pending = latest_codex_log_is_pending()
+
     print(f"{'claude setup:':14}" + ("yes" if claude_setup else "no  — run 'keep5 setup'"))
     print(f"{'codex setup:':14}" + ("yes" if codex_setup else "no  — run 'keep5 setup'"))
     print(f"{'enabled:':14}{enabled_val}")
@@ -650,6 +664,8 @@ def cmd_status():
             due = f"in {dur(-over)}"
         elif over <= interval:
             due = "due now"
+        elif label == "codex reset:" and codex_pending:
+            due = f"pending {dur(over)} — waiting to confirm reset"
         else:
             due = f"⚠ overdue {dur(over)} — check log"
         print(f"{label:14}{due}  ({fmt(nr)})")
